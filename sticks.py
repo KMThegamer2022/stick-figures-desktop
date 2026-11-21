@@ -226,8 +226,10 @@ class Explorer:
                 s.opened.update({h: time.time() for h in new}); s.pending = None
                 if s.opener: s.opener.visit, s.opener = min(new), None
             elif time.time() - s.last > 5: s.pending = None
-        for h, t in list(s.opened.items()):           # WM_CLOSE only windows we opened, once they're old (or if >2)
-            if time.time() - t > 200 or len(s.opened) > 2: u32.PostMessageW(h, 0x10, 0, 0); del s.opened[h]
+        for h, t in list(s.opened.items()):           # nobody got round to closing it (or >2 open): close it ourselves
+            if time.time() - t > 320 or len(s.opened) > 2: s.close(h)
+    def due(s): return [h for h, t in s.opened.items() if time.time() - t > 200]   # old enough for a figure to go and click its X
+    def close(s, h): u32.PostMessageW(h, 0x10, 0, 0); s.opened.pop(h, None)        # WM_CLOSE; only ever called on windows we opened
 
 EXPL = Explorer()
 
@@ -260,9 +262,10 @@ class Fig:
     def __init__(s, color):
         s.c, s.x, s.y, s.vx, s.vy, s.t, s.acc = color, random.uniform(VX+80, VX+VW-80), VY+40, 0, 0, 0, 0
         s.dir, s.mode, s.act, s.sup, s.supl, s.goal, s.timer = random.choice((-1, 1)), 'air', 'walk', None, 0, None, 0
-        s.tgt = s.pw = s.cw = s.top = s.cross = s.ic = s.visit = s.hail = None; s.wall, s.pushback = 1, 0
+        s.tgt = s.pw = s.cw = s.top = s.cross = s.ic = s.visit = s.hail = s.after = None; s.wall, s.pushback, s.kill = 1, 0, False
         # cross=(window, gap side); pushback=dir to shove next; ic=(folder, x, y) desktop icon we're climbing to;
-        # visit=folder window just opened, to go play on; hail=window we're heading for, to dance on once there
+        # visit=folder window just opened, to go play on; hail=window we're heading for, to dance on once there;
+        # after=(window, goal kind) to start once we're standing on that window; kill=the stomp closes (not minimises)
 
     def step(s, W):
         s.t += 1
@@ -278,6 +281,9 @@ class Fig:
         if s.cross:                                    # got on top of the window we pushed: cross to the gap side
             if h == s.cross[0]: s.goal = ('walkoff', h, s.cross[1])
             else: s.cross = None
+        if s.after:                                    # reached the window we were heading for: start the job
+            if h == s.after[0]: s.goal = (s.after[1], h, None)
+            s.after = None
         if s.goal: s.timer = 400
         if s.pushback:                                 # dropped into the gap: now shove it back the other way
             if h is None: s.dir, s.timer = s.pushback, 300
@@ -336,7 +342,7 @@ class Fig:
                 s.dir = -s.dir
             elif not s.sup and not s.goal: s.shove(W)
         elif s.act == 'push': s.push()
-        elif s.act == 'stomp' and s.timer == 22 and s.tgt: minimize(s.tgt)
+        elif s.act == 'stomp' and s.timer == 22 and s.tgt: (EXPL.close if s.kill else minimize)(s.tgt)
         elif s.act == 'knock' and s.timer == 22: EXPL.open_next(None, s)
         s.timer -= 1
         if s.timer <= 0: s.think(W)
@@ -385,6 +391,10 @@ class Fig:
             if abs(tx - s.x) < SPEED+.5:
                 s.mode, s.wall, s.cw, s.goal, s.timer = 'climb', w, None, None, 0
                 s.top = min(max(s.ic[2]+40, VY+90), FLOOR-60); return True   # feet ~40px below the icon's middle
+        elif k == 'close':                                     # on top of an old folder window: walk to its X and stomp it
+            if s.sup != h: s.goal = None; return False
+            tx = min(max(R[2]-24, R[0]+20), R[2]-20)           # the close button is the far-right ~46px of the title bar
+            if abs(tx - s.x) < SPEED+.5: s.act, s.timer, s.tgt, s.kill, s.goal = 'stomp', 45, h, True, None; return True
         elif k == 'open':                                      # on top of a folder window we opened: knock to open a subfolder
             if s.sup != h: s.goal = None; return False
             tx = (R[0]+R[2])/2
@@ -395,7 +405,7 @@ class Fig:
         elif k == 'press':
             if s.sup != h: s.goal = None; return False
             tx = min(max(R[2]-115, R[0]+20), R[2]-20)          # about where the minimise button is
-            if abs(tx - s.x) < SPEED+.5: s.act, s.timer, s.tgt, s.goal = 'stomp', 45, h, None; return True
+            if abs(tx - s.x) < SPEED+.5: s.act, s.timer, s.tgt, s.kill, s.goal = 'stomp', 45, h, False, None; return True
         s.dir = 1 if tx > s.x else -1
         return False
 
@@ -408,6 +418,14 @@ class Fig:
                 s.goal, s.timer = ('climb', w[0], 1 if s.x < (w[1]+w[3])/2 else -1), 400; return
             s.cross = None
         exposed = lambda w: any(h == w[0] for _, h in tops(W, min(max(s.x, w[1]+30), w[3]-30)))
+        old = EXPL.due()
+        for w in W:                                    # a folder window we opened is overdue: go and click its X
+            if w[0] in old and exposed(w):
+                if s.sup == w[0]: s.goal, s.timer = ('close', w[0], None), 400; return
+                if y-w[2] > 20:
+                    s.after, s.timer = (w[0], 'close'), 400
+                    s.goal = ('jump', w[0], None) if y-w[2] <= JUMP_MAX else ('climb', w[0], 1 if s.x < (w[1]+w[3])/2 else -1)
+                    return
         if s.visit:                                    # we just opened a folder window: jump onto it, or climb its side
             w = next((w for w in W if w[0] == s.visit), None); s.visit = None
             if w and exposed(w) and y-w[2] > 20:
@@ -544,8 +562,10 @@ def main():
 def selftest():
     global live, move, minimize, cursor, down, VX, VY, VW, VH, FLOOR, EXPL
     class FakeExplorer:                           # no real folders opened in the test
-        n = desk = 0
+        n = desk = closed = 0
         opened = {4: 0}                           # pretend window 4 is a folder window we opened
+        due = lambda s: [4] if s.closed < 3 else []      # ...that is overdue for closing until figures have closed it 3 times
+        def close(s, h): s.closed += 1
         ready = lambda s: True
         desk_target = lambda s: ("C:/folder", 60, 500)   # a desktop icon near the left edge
         def open_next(s, path=None, fig=None):
@@ -613,6 +633,7 @@ def selftest():
     assert EXPL.desk, "no figure ever climbed up to a desktop icon"
     assert EXPL.n > EXPL.desk, "no figure ever opened a subfolder from a folder window"
     assert hails[0], "no figure ever went to play on a folder it opened"
+    assert EXPL.closed, "no figure ever climbed up and clicked a folder window's X"
     Z[:] = [(98, 0, 0, 1920, 1040)]               # a maximised window covers the desktop: icons must count as out of reach
     assert not uncovered(60, 500)
     Z[:] = []
