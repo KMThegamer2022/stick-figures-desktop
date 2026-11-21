@@ -1,6 +1,11 @@
+#define V GetEnv("APP_VERSION")
+#if V == ""
+  #define V "0.0.0"
+#endif
+
 [Setup]
 AppName=Stick Figures
-AppVersion=1.0
+AppVersion={#V}
 DefaultDirName={autopf}\StickFigures
 DefaultGroupName=Stick Figures
 OutputDir=dist

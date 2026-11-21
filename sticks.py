@@ -8,8 +8,13 @@ They walk, dance, wave, chase your mouse, jump onto windows, climb window sides 
 the screen edges, shove windows sideways, and stomp a window's minimise button.
 Maximised / minimised windows are never touched. The overlay is click-through.
 """
-import ctypes, math, os, random, sys, time
+import ctypes, json, math, os, random, shutil, sys, threading, time
+import urllib.error, urllib.request
 from ctypes import wintypes as wt
+
+REPO = "KMThegamer2022/stick-figures-desktop"
+VERSION = "0.0.0"                          # stamped from the git tag by the release workflow
+AUTO_UPDATE = True                         # check GitHub for a newer release at start (installed .exe only)
 
 GRAV, JUMP_V, JUMP_MAX = 0.9, 16.5, 135   # JUMP_MAX: tallest ledge (px) a jump can reach
 SPEED, PUSH, CLIMB = 2.2, 1.6, 2.0
@@ -74,6 +79,38 @@ def list_windows():
         return True
     u32.EnumWindows(cb, 0)
     return out
+
+
+# ---- updater ----------------------------------------------------------------------------
+def ver(tag):
+    """'v1.10' -> (1, 10). shortcut: numeric dotted tags only; anything else parses as () = never newer."""
+    return tuple(int(x) for x in tag.lstrip("v").split(".") if x.isdigit())
+
+def latest_tag():
+    """Newest release tag. Tries the GitHub API; on rate limit (403/429), outage or bad reply it falls back
+    to the github.com/<repo>/releases/latest redirect, which isn't subject to the API's anonymous limit."""
+    try:
+        req = urllib.request.Request(f"https://api.github.com/repos/{REPO}/releases/latest",
+                                     headers={"User-Agent": "stick-figures-updater", "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=10) as r: return json.load(r)["tag_name"]
+    except (urllib.error.URLError, OSError, KeyError, ValueError):   # HTTPError (rate limit, 5xx) is a URLError
+        with urllib.request.urlopen(f"https://github.com/{REPO}/releases/latest", timeout=10) as r:
+            return r.geturl().rsplit("/", 1)[-1]                      # redirect ends in .../tag/<tag>
+
+def newer_tag():
+    try: t = latest_tag(); return t if ver(t) > ver(VERSION) else None
+    except Exception: return None    # offline / blocked: just don't update; the app must never fail over this
+
+def swap_exe(tag, exe):
+    """Download the release's sticks.exe and swap it in. A running exe can be renamed but not overwritten."""
+    new = exe + ".new"
+    with urllib.request.urlopen(f"https://github.com/{REPO}/releases/download/{tag}/sticks.exe", timeout=30) as r, \
+         open(new, "wb") as f: shutil.copyfileobj(r, f)
+    with open(new, "rb") as f: ok = f.read(2) == b"MZ"               # sanity: it's a Windows program, not an error page
+    if not ok: os.remove(new); raise ValueError("download was not a program")
+    os.replace(exe, exe + ".old")
+    try: os.replace(new, exe)
+    except OSError: os.replace(exe + ".old", exe); raise
 
 
 def explorer_hwnds():
@@ -336,10 +373,25 @@ def main():
     # layered | transparent (click-through) | toolwindow (no taskbar) | noactivate (no focus theft)
     u32.SetWindowLongW(hw, -20, u32.GetWindowLongW(hw, -20) | 0x80000 | 0x20 | 0x80 | 0x08000000)
     OWN.update({hw, root.winfo_id()})
-    figs, W, frame = [Fig(COLORS[i % len(COLORS)]) for i in range(n)], [], [0]
+    figs, W, frame, found = [Fig(COLORS[i % len(COLORS)]) for i in range(n)], [], [0], []
+    if AUTO_UPDATE and getattr(sys, "frozen", False):      # only the built .exe self-updates, never a source checkout
+        try: os.remove(sys.executable + ".old")
+        except OSError: pass
+        threading.Thread(target=lambda: found.append(newer_tag()), daemon=True).start()
+
+    def offer(tag):
+        from tkinter import messagebox
+        if not messagebox.askyesno("Stick Figures", f"Version {tag} is available (you have {VERSION}).\nDownload it and restart now?"):
+            return False
+        try: swap_exe(tag, sys.executable)
+        except Exception as e:
+            messagebox.showerror("Stick Figures", f"Update failed: {e}\nDownload it from https://github.com/{REPO}/releases")
+            return False
+        os.startfile(sys.executable); return True
 
     def tick():
         frame[0] += 1
+        if found and (t := found.pop()) and offer(t): return root.destroy()
         if frame[0] % 6 == 1: W[:] = list_windows(); EXPL.poll()
         if frame[0] % 90 == 0: root.attributes('-topmost', True)
         if all(u32.GetAsyncKeyState(k) & 0x8000 for k in (0x11, 0x10, 0x51)): return root.destroy()
@@ -356,6 +408,28 @@ def selftest():
         ready = lambda s: True
         def open_next(s): s.n += 1
     EXPL = FakeExplorer()
+    import io, tempfile
+
+    class Resp(io.BytesIO):                        # stands in for a urlopen() response
+        def __init__(s, body=b"", url=""): super().__init__(body); s.u = url
+        def geturl(s): return s.u
+    mode = ["ok"]
+    def fake(req, timeout=0):
+        u = req if isinstance(req, str) else req.full_url
+        if "api.github.com" in u:
+            if mode[0] == "ok": return Resp(b'{"tag_name": "v9.1"}')
+            raise urllib.error.HTTPError(u, 403, "rate limit exceeded", {}, None)
+        if "/releases/download/" in u: return Resp(b"MZ-new-exe")
+        return Resp(url=f"https://github.com/{REPO}/releases/tag/v9.2")
+    urllib.request.urlopen = fake
+    assert latest_tag() == "v9.1"                  # API works
+    mode[0] = "limited"
+    assert latest_tag() == "v9.2"                  # rate limited -> redirect fallback
+    assert ver("v1.10") > ver("1.9") and ver("releases") == () and newer_tag() == "v9.2"
+    with tempfile.TemporaryDirectory() as d:       # swap keeps the old exe aside and puts the new one in place
+        exe = os.path.join(d, "sticks.exe"); open(exe, "wb").write(b"MZ-old")
+        swap_exe("v9.2", exe)
+        assert open(exe, "rb").read() == b"MZ-new-exe" and open(exe + ".old", "rb").read() == b"MZ-old"
     VX, VY, VW, VH, FLOOR = 0, 0, 1920, 1080, 1040   # the fake windows below assume this screen
     for dh in (20, 80, 130):                      # closed-form jump time must match frame-by-frame physics
         y, vy, n = 0, -JUMP_V, 0
