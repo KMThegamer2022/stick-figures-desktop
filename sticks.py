@@ -39,9 +39,18 @@ if WIN:
                            GetWindowTextLengthW=[H], GetWindowLongW=[H, I], SetWindowLongW=[H, I, ctypes.c_long],
                            GetClassNameW=[H, wt.LPWSTR, I], GetWindowRect=[H, ctypes.c_void_p], ShowWindow=[H, I],
                            SetWindowPos=[H, H, I, I, I, I, wt.UINT], GetAncestor=[H, wt.UINT],
-                           PostMessageW=[H, wt.UINT, wt.WPARAM, wt.LPARAM]).items():
+                           PostMessageW=[H, wt.UINT, wt.WPARAM, wt.LPARAM],
+                           FindWindowW=[wt.LPCWSTR, wt.LPCWSTR], FindWindowExW=[H, H, wt.LPCWSTR, wt.LPCWSTR],
+                           GetWindowThreadProcessId=[H, ctypes.POINTER(wt.DWORD)], ClientToScreen=[H, ctypes.POINTER(wt.POINT)],
+                           SendMessageTimeoutW=[H, wt.UINT, wt.WPARAM, wt.LPARAM, wt.UINT, wt.UINT, ctypes.POINTER(ctypes.c_size_t)]).items():
         getattr(u32, name).argtypes = args
-    u32.GetAncestor.restype = H
+    u32.GetAncestor.restype = u32.FindWindowW.restype = u32.FindWindowExW.restype = H
+    k32, P, SZ = ctypes.windll.kernel32, ctypes.c_void_p, ctypes.c_size_t
+    for name, args in dict(OpenProcess=[wt.DWORD, wt.BOOL, wt.DWORD], CloseHandle=[P],
+                           VirtualAllocEx=[P, P, SZ, wt.DWORD, wt.DWORD], VirtualFreeEx=[P, P, SZ, wt.DWORD],
+                           ReadProcessMemory=[P, P, P, SZ, P], WriteProcessMemory=[P, P, P, SZ, P]).items():
+        getattr(k32, name).argtypes = args
+    k32.OpenProcess.restype = k32.VirtualAllocEx.restype = P
     dwm.DwmGetWindowAttribute.argtypes = [H, wt.DWORD, ctypes.c_void_p, wt.DWORD]
     VX, VY, VW, VH = (u32.GetSystemMetrics(i) for i in (76, 77, 78, 79))
     _wa = wt.RECT(); u32.SystemParametersInfoW(48, 0, ctypes.byref(_wa), 0); FLOOR = _wa.bottom
@@ -144,23 +153,81 @@ def folders(p):
     except OSError:
         return []
 
+class LVITEM(ctypes.Structure):                    # start of the Win32 LVITEMW; the rest stays zero in the remote buffer
+    _fields_ = [("mask", wt.UINT), ("iItem", ctypes.c_int), ("iSubItem", ctypes.c_int), ("state", wt.UINT),
+                ("stateMask", wt.UINT), ("pszText", ctypes.c_void_p), ("cchTextMax", ctypes.c_int),
+                ("iImage", ctypes.c_int), ("lParam", ctypes.c_void_p)]
+
+def desktop_icons():
+    """[(folder_path, x, y)]: screen positions of the Desktop's folder icons, read from Explorer's own icon list
+    (a list-view in another process, so we borrow a bit of its memory to ask it questions).
+    Any failure (icons hidden, odd shell, access denied) returns [] and the figures just skip walking up to icons."""
+    try:
+        dv = u32.FindWindowExW(u32.FindWindowW("Progman", None), None, "SHELLDLL_DefView", None)
+        w = None
+        while not dv:                                  # with some wallpaper setups the icons live under a WorkerW
+            w = u32.FindWindowExW(None, w, "WorkerW", None)
+            if not w: return []
+            dv = u32.FindWindowExW(w, None, "SHELLDLL_DefView", None)
+        lv = u32.FindWindowExW(dv, None, "SysListView32", None)
+        if not lv or not u32.IsWindowVisible(lv): return []
+        names = {os.path.basename(p): p for p in folders(desktop())}
+        pid = wt.DWORD(); u32.GetWindowThreadProcessId(lv, ctypes.byref(pid))
+        proc = k32.OpenProcess(0x0438, False, pid.value)         # VM operation | read | write | query
+        if not proc: return []
+        def ask(msg, i, lp):                           # SendMessage that gives up instead of hanging if Explorer is stuck
+            res = ctypes.c_size_t()
+            return res.value if u32.SendMessageTimeoutW(lv, msg, i, lp, 2, 300, ctypes.byref(res)) else None
+        out, mem = [], None
+        try:
+            mem = k32.VirtualAllocEx(proc, None, 4096, 0x3000, 4)   # zeroed scratch: POINT at +0, LVITEM at +64, text at +512
+            for i in range(min(ask(0x1004, 0, 0) or 0, 300)):       # LVM_GETITEMCOUNT
+                it, pt, buf = LVITEM(1, i, 0, 0, 0, mem + 512, 260, 0, 0), wt.POINT(), ctypes.create_string_buffer(520)
+                k32.WriteProcessMemory(proc, mem + 64, ctypes.byref(it), ctypes.sizeof(it), None)
+                if ask(0x1073, i, mem + 64) is None or ask(0x1010, i, mem) is None: continue   # GETITEMTEXTW, GETITEMPOSITION
+                k32.ReadProcessMemory(proc, mem, ctypes.byref(pt), 8, None)
+                k32.ReadProcessMemory(proc, mem + 512, buf, 520, None)
+                name = buf.raw.decode("utf-16-le").split("\0")[0]
+                if name in names and u32.ClientToScreen(lv, ctypes.byref(pt)):
+                    out.append((names[name], pt.x + 40, pt.y + 35))     # +40,+35: roughly the middle of the icon
+        finally:
+            if mem: k32.VirtualFreeEx(proc, mem, 0, 0x8000)
+            k32.CloseHandle(proc)
+        return out
+    except Exception:
+        return []
+
 class Explorer:
-    """Opens a Desktop folder in File Explorer, then often a subfolder of it, and so on. At most 2 stay open."""
-    def __init__(s): s.path = s.pending = None; s.opened = []; s.last = 0
-    def ready(s): return EXPLORE and time.time() - s.last > 20
-    def open_next(s):
-        s.last = time.time()
-        subs = folders(s.path) if s.path else []
-        s.path = random.choice(subs) if subs and random.random() < .7 else random.choice(folders(desktop()) or [None])
-        if s.path: s.pending = explorer_hwnds(); os.startfile(s.path)
+    """Opens Desktop folders in File Explorer, then subfolders of the last one. Rare (every 1.5-3 min), and its
+    windows are closed again after ~3 min."""
+    def __init__(s):
+        s.path = s.pending = s.icons = s.opener = None; s.opened = {}      # opened: hwnd -> time opened
+        s.last, s.gap, s.icons_t = time.time(), 45, 0
+    def ready(s): return EXPLORE and time.time() - s.last > s.gap
+    def desk_target(s):
+        """(path, x, y) of a visible Desktop folder icon near enough a screen edge to climb up to, else None."""
+        if time.time() - s.icons_t > 30: s.icons, s.icons_t = desktop_icons(), time.time()
+        ok = [i for i in s.icons or [] if min(i[1]-VX, VX+VW-i[1]) <= 260 and uncovered(i[1], i[2])]   # edge-reachable, in view
+        return random.choice(ok) if ok else None
+    def open_next(s, path=None, fig=None):
+        """fig = the figure doing it: once the new window shows up it's sent to play on it."""
+        s.last, s.gap, s.opener = time.time(), random.uniform(90, 180), fig
+        if not path:                                   # no icon given: go one level deeper from the last folder
+            subs = folders(s.path) if s.path else []
+            path = random.choice(subs) if subs and random.random() < .7 else random.choice(folders(desktop()) or [None])
+        s.path = path
+        if path: s.pending = explorer_hwnds(); os.startfile(path)
     def poll(s):
         if s.pending is None and not s.opened: return
-        s.opened = [h for h in s.opened if u32.IsWindow(h)]
+        s.opened = {h: t for h, t in s.opened.items() if u32.IsWindow(h)}
         if s.pending is not None:                     # find the window Explorer just made so we can close it later
             new = explorer_hwnds() - s.pending
-            if new: s.opened += sorted(new); s.pending = None
+            if new:
+                s.opened.update({h: time.time() for h in new}); s.pending = None
+                if s.opener: s.opener.visit, s.opener = min(new), None
             elif time.time() - s.last > 5: s.pending = None
-        while len(s.opened) > 2: u32.PostMessageW(s.opened.pop(0), 0x10, 0, 0)   # WM_CLOSE the oldest of ours
+        for h, t in list(s.opened.items()):           # WM_CLOSE only windows we opened, once they're old (or if >2)
+            if time.time() - t > 200 or len(s.opened) > 2: u32.PostMessageW(h, 0x10, 0, 0); del s.opened[h]
 
 EXPL = Explorer()
 
@@ -179,6 +246,10 @@ def covered(h, x, y, W):
         if w[1] < x < w[3] and w[2] <= y < w[4]: return True
     return False
 
+def uncovered(x, y):
+    """Is screen point (x,y) in plain view, i.e. no window (maximised and fullscreen ones included) over it?"""
+    return not any(w[1] < x < w[3] and w[2] <= y < w[4] for w in Z)
+
 def tops(W, x):
     """(y, hwnd) of window top edges at column x that you can actually see, plus the floor."""
     for h, l, t, r, b in W:
@@ -189,7 +260,9 @@ class Fig:
     def __init__(s, color):
         s.c, s.x, s.y, s.vx, s.vy, s.t, s.acc = color, random.uniform(VX+80, VX+VW-80), VY+40, 0, 0, 0, 0
         s.dir, s.mode, s.act, s.sup, s.supl, s.goal, s.timer = random.choice((-1, 1)), 'air', 'walk', None, 0, None, 0
-        s.tgt = s.pw = s.cw = s.top = s.cross = None; s.wall, s.pushback = 1, 0   # cross=(window, gap side); pushback=dir to shove next
+        s.tgt = s.pw = s.cw = s.top = s.cross = s.ic = s.visit = s.hail = None; s.wall, s.pushback = 1, 0
+        # cross=(window, gap side); pushback=dir to shove next; ic=(folder, x, y) desktop icon we're climbing to;
+        # visit=folder window just opened, to go play on; hail=window we're heading for, to dance on once there
 
     def step(s, W):
         s.t += 1
@@ -201,7 +274,7 @@ class Fig:
         g = s.goal
         s.y, s.vx, s.vy, s.mode, s.sup, s.act, s.timer = y, 0, 0, 'ground', h, 'walk', 20
         r = h and live(h); s.supl = r[0] if r else 0
-        if g and g[0] == 'jump': s.goal = ('press', h, None) if g[1] == h and g[2] == 'press' else None
+        if g and g[0] == 'jump': s.goal = (g[2], h, None) if g[1] == h and g[2] in ('press', 'open') else None
         if s.cross:                                    # got on top of the window we pushed: cross to the gap side
             if h == s.cross[0]: s.goal = ('walkoff', h, s.cross[1])
             else: s.cross = None
@@ -209,6 +282,7 @@ class Fig:
         if s.pushback:                                 # dropped into the gap: now shove it back the other way
             if h is None: s.dir, s.timer = s.pushback, 300
             s.pushback = 0
+        if h and h == s.hail: s.act, s.timer, s.hail = 'dance', 90, None   # made it onto the folder window: celebrate
 
     def fly(s, W):
         py = s.y; s.vy += GRAV; s.y += s.vy
@@ -224,6 +298,9 @@ class Fig:
         if s.cw and not R: return s.drop()
         if s.timer:                                    # hanging at the top: let go when done
             s.timer -= 1
+            if s.ic and s.timer == 30:                         # reached the icon: open that folder, if it's still in view
+                if uncovered(s.ic[1], s.ic[2]): EXPL.open_next(s.ic[0], s)
+                s.ic = None
             if not s.timer: s.drop(-s.wall*4, -9)
             return
         s.y -= CLIMB
@@ -242,6 +319,7 @@ class Fig:
             s.x += R[0]-s.supl; s.supl = R[0]; s.y = R[1]      # ride the window
             lo, hi = R[0]+10, R[2]-10
         else: s.y, lo, hi = FLOOR, VX+10, VX+VW-10
+        if s.visit and s.act == 'walk' and not s.goal: return s.think(W)   # the folder we opened is up: go to it now
         if s.act == 'walk':
             if s.goal and s.steer(): return
             s.x += s.dir*SPEED
@@ -259,7 +337,7 @@ class Fig:
             elif not s.sup and not s.goal: s.shove(W)
         elif s.act == 'push': s.push()
         elif s.act == 'stomp' and s.timer == 22 and s.tgt: minimize(s.tgt)
-        elif s.act == 'knock' and s.timer == 22: EXPL.open_next()
+        elif s.act == 'knock' and s.timer == 22: EXPL.open_next(None, s)
         s.timer -= 1
         if s.timer <= 0: s.think(W)
 
@@ -301,6 +379,16 @@ class Fig:
             if abs(tx - s.x) < SPEED+.5:
                 s.mode, s.wall, s.cw, s.goal, s.timer = 'climb', w, h, None, 0
                 s.top = VY+90 + random.random()*(FLOOR-VY-240); return True
+        elif k == 'desk':                                      # walk to the screen edge, climb to the icon's height
+            if not s.ic or not uncovered(s.ic[1], s.ic[2]): s.goal = s.ic = None; return False   # something covered it
+            tx = VX+8 if w < 0 else VX+VW-8
+            if abs(tx - s.x) < SPEED+.5:
+                s.mode, s.wall, s.cw, s.goal, s.timer = 'climb', w, None, None, 0
+                s.top = min(max(s.ic[2]+40, VY+90), FLOOR-60); return True   # feet ~40px below the icon's middle
+        elif k == 'open':                                      # on top of a folder window we opened: knock to open a subfolder
+            if s.sup != h: s.goal = None; return False
+            tx = (R[0]+R[2])/2
+            if abs(tx - s.x) < SPEED+.5: s.act, s.timer, s.goal = 'knock', 45, None; return True
         elif k == 'walkoff':
             if s.sup != h: s.goal = None; return False
             s.dir = w; return False
@@ -312,7 +400,7 @@ class Fig:
         return False
 
     def think(s, W):
-        y = s.y; s.goal = None; s.act = 'walk'; s.timer = random.randint(60, 200); s.dir = random.choice((-1, 1))
+        y = s.y; s.goal = s.ic = None; s.act = 'walk'; s.timer = random.randint(60, 200); s.dir = random.choice((-1, 1))
         if s.cross:                                    # just pushed a window to its limit: get on top of it
             w = next((w for w in W if w[0] == s.cross[0]), None)
             if w and 20 < y-w[2] <= JUMP_MAX: s.goal, s.timer = ('jump', w[0], None), 400; return
@@ -320,19 +408,29 @@ class Fig:
                 s.goal, s.timer = ('climb', w[0], 1 if s.x < (w[1]+w[3])/2 else -1), 400; return
             s.cross = None
         exposed = lambda w: any(h == w[0] for _, h in tops(W, min(max(s.x, w[1]+30), w[3]-30)))
+        if s.visit:                                    # we just opened a folder window: jump onto it, or climb its side
+            w = next((w for w in W if w[0] == s.visit), None); s.visit = None
+            if w and exposed(w) and y-w[2] > 20:
+                s.hail, s.timer = w[0], 400
+                s.goal = ('jump', w[0], None) if y-w[2] <= JUMP_MAX else ('climb', w[0], 1 if s.x < (w[1]+w[3])/2 else -1)
+                return
         ledges = [w for w in W if 20 < y-w[2] <= JUMP_MAX and w[0] != s.sup and exposed(w)]
         walls = [w for w in W if y-w[2] > JUMP_MAX and w[2] > VY+90 and w[4] > y-20 and exposed(w)]
         blockers = [w for w in W if w[2] < y-15 and w[4] > y-45 and w[3]-w[1] < VW*.9
                     and not covered(w[0], w[1] if s.x < (w[1]+w[3])/2 else w[3], y-30, W)]
         opts = ['walk']*3 + ['dance', 'wave', 'cursor']
         if not s.sup: opts += ['edge'] + ['push']*2*bool(blockers)
-        if EXPL.ready(): opts += ['explore']*2
+        ours = [w for w in ledges if w[0] in EXPL.opened]          # a folder window we opened, close enough to jump onto
+        ic = EXPL.desk_target() if EXPL.ready() and not s.sup else None   # a visible Desktop folder icon to climb up to
+        if EXPL.ready() and (ours or ic): opts += ['explore']
         if ledges: opts += ['jump']*3
         if walls: opts += ['climb']*2
         k = random.choice(opts)
         if k == 'dance': s.act, s.timer = 'dance', random.randint(60, 120)
         elif k == 'wave': s.act, s.timer = 'wave', 70
-        elif k == 'explore': s.act, s.timer = 'knock', 45      # stomp pose; opens the folder mid-stomp
+        elif k == 'explore':
+            if ours and (not ic or random.random() < .5): s.goal, s.timer = ('jump', random.choice(ours)[0], 'open'), 400
+            else: s.ic, s.goal, s.timer = ic, ('desk', None, -1 if ic[1]-VX < VX+VW-ic[1] else 1), 400
         elif k == 'cursor': s.goal, s.timer = ('cursor', None, None), 400
         elif k == 'edge': s.goal, s.timer = ('climb', None, -1 if s.x < VX+VW/2 else 1), 400
         elif k == 'jump':
@@ -366,6 +464,7 @@ class Fig:
         elif a == 'climb':
             c = 0 if s.timer else math.sin(s.t*.3); lean = 6
             A, G = [(160+15*c, 175), (160-15*c, 175)], [(50+25*c, 5), (50-25*c, 5)]
+            if s.timer and s.ic: A[1] = (95, 100)                # hanging by one hand, reaching out to the icon
         elif a in ('stomp', 'knock'):
             hop = 14*abs(math.sin(s.timer*.25)); A, G = [(130, 140), (125, 135)], [(10, 0), (-10, 0)]
         hx, hy = x, y - 30 - hop
@@ -445,9 +544,13 @@ def main():
 def selftest():
     global live, move, minimize, cursor, down, VX, VY, VW, VH, FLOOR, EXPL
     class FakeExplorer:                           # no real folders opened in the test
-        n = 0
+        n = desk = 0
+        opened = {4: 0}                           # pretend window 4 is a folder window we opened
         ready = lambda s: True
-        def open_next(s): s.n += 1
+        desk_target = lambda s: ("C:/folder", 60, 500)   # a desktop icon near the left edge
+        def open_next(s, path=None, fig=None):
+            s.n += 1; s.desk += bool(path)
+            if fig: fig.visit = 4                 # as if window 4 had just appeared for them to visit
     EXPL = FakeExplorer()
     import io, tempfile
 
@@ -483,12 +586,14 @@ def selftest():
     wins = {1: [100, 700, 500, 1040], 2: [800, 500, 1200, 900], 3: [300, 100, 600, 200], 4: [1300, 950, 1700, 1040]}
     live = lambda h: tuple(wins[h]) if h in wins else None
     def move(h, dx): wins[h][0] += dx; wins[h][2] += dx
-    minimize = lambda h: wins.pop(h, None)
+    minimize = lambda h: wins.pop(h, None) if h != 4 else None   # window 4 stands in for a folder window that stays put
     cursor, down = (lambda: (900, 500)), (lambda: 0)
     random.seed(1)
     figs, seen, hops = [Fig(COLORS[i]) for i in range(4)], set(), [0]
     _land = Fig.land
-    def land(s, y, h): hops[0] += bool(s.pushback and h is None); _land(s, y, h)   # count hop-into-gap landings
+    hails = [0]
+    def land(s, y, h):                            # count hop-into-gap landings and arrivals on a folder window
+        hops[0] += bool(s.pushback and h is None); hails[0] += bool(h and h == s.hail); _land(s, y, h)
     Fig.land = land
     class CV:                                     # draw() must run too
         def create_line(self, *a, **k): assert len(a) == 6 or len(a) == 4
@@ -505,7 +610,12 @@ def selftest():
     assert list(tops([(h, *w) for h, w in wins.items()], 1000)) == [(FLOOR, None)], "walked on a hidden window"
     assert covered(2, 1000, 502, [(h, *w) for h, w in wins.items()])
     Z[:] = []
-    assert EXPL.n, "no figure ever opened a folder"
+    assert EXPL.desk, "no figure ever climbed up to a desktop icon"
+    assert EXPL.n > EXPL.desk, "no figure ever opened a subfolder from a folder window"
+    assert hails[0], "no figure ever went to play on a folder it opened"
+    Z[:] = [(98, 0, 0, 1920, 1040)]               # a maximised window covers the desktop: icons must count as out of reach
+    assert not uncovered(60, 500)
+    Z[:] = []
     print("ok; behaviours seen:", sorted(seen), "gap hops:", hops[0], "windows left:", len(wins))
 
 
