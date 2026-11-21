@@ -279,7 +279,8 @@ def main():
 
 
 def selftest():
-    global live, move, minimize, cursor, down
+    global live, move, minimize, cursor, down, VX, VY, VW, VH, FLOOR
+    VX, VY, VW, VH, FLOOR = 0, 0, 1920, 1080, 1040   # the fake windows below assume this screen
     for dh in (20, 80, 130):                      # closed-form jump time must match frame-by-frame physics
         y, vy, n = 0, -JUMP_V, 0
         while True:
