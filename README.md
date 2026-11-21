@@ -11,7 +11,8 @@ Download `StickFiguresSetup.exe` (or the portable `sticks.exe`) from the latest
 [Release](../../releases). Windows SmartScreen may warn because the file is unsigned.
 
 ## Run from source
-`python sticks.py [count]`. Quit with **Ctrl+Shift+Q**. Set `PRESS_MINIMIZE = False` in
+`python sticks.py [count]` (optional: `pip install pystray pillow` for the tray icon). Quit from the tray icon's
+**Quit** item, or with **Ctrl+Shift+Q**. Set `PRESS_MINIMIZE = False` in
 `sticks.py` to stop figures minimising windows.
 
 ## Build

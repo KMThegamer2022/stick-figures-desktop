@@ -1,7 +1,7 @@
 @echo off
 rem Builds dist\sticks.exe, then dist\StickFiguresSetup.exe if Inno Setup 6 is installed.
 cd /d "%~dp0"
-py -m pip install --quiet pyinstaller || goto :err
+py -m pip install --quiet pyinstaller pystray pillow || goto :err
 py -m PyInstaller --onefile --noconsole --name sticks sticks.py || goto :err
 set ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe
 if not exist "%ISCC%" goto :noinno

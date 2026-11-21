@@ -25,6 +25,7 @@ COLORS = ["#202020", "#e03030", "#2fa84f", "#2f6fe0", "#f0b020", "#f07820"]
 SKIP = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}
 KEY = "#010101"                            # transparent colour of the overlay
 OWN = set()
+Z = []                                     # every visible window, topmost first; refreshed by the main loop
 
 # shortcut: floor = bottom of the PRIMARY monitor's work area; upgrade if you want per-monitor floors
 VX, VY, VW, VH, FLOOR = 0, 0, 1920, 1080, 1040
@@ -48,12 +49,16 @@ if WIN:
 
 
 # ---- Windows glue (the selftest swaps these for fakes) ---------------------------------
-def live(h):
-    """Frame (l,t,r,b) of a window we may use, or None if gone / minimised / maximised."""
-    if not (u32.IsWindow(h) and u32.IsWindowVisible(h)) or u32.IsIconic(h) or u32.IsZoomed(h): return None
+def rect(h):
+    """Visible frame (l,t,r,b) of a window that is on screen (maximised ones included), else None."""
+    if not (u32.IsWindow(h) and u32.IsWindowVisible(h)) or u32.IsIconic(h): return None
     r = wt.RECT()
     if dwm.DwmGetWindowAttribute(h, 9, ctypes.byref(r), ctypes.sizeof(r)): u32.GetWindowRect(h, ctypes.byref(r))
     return r.left, r.top, r.right, r.bottom
+
+def live(h):
+    """Frame of a window we may use, or None if gone / minimised / maximised."""
+    return None if u32.IsZoomed(h) else rect(h)
 
 def move(h, dx):  # NOSIZE | NOZORDER | NOACTIVATE
     r = wt.RECT(); u32.GetWindowRect(h, ctypes.byref(r)); u32.SetWindowPos(h, 0, r.left + dx, r.top, 0, 0, 0x15)
@@ -66,19 +71,24 @@ def cursor():
 def down(): return u32.GetAsyncKeyState(1) & 0x8000   # left mouse button: never fight the user's drag
 
 def list_windows():
-    """Movable top-level windows, topmost first: (hwnd, l, t, r, b)."""
-    out = []
+    """(movable, everything), each topmost first as (hwnd, l, t, r, b). movable = windows we may stand on, shove or
+    minimise (not maximised, not tool windows); everything = every visible window, to tell which are hidden behind others."""
+    mov, allw = [], []
     @ENUM
     def cb(h, _):
-        if h not in OWN and u32.GetWindowTextLengthW(h) and not u32.GetWindowLongW(h, -20) & 0x08000080:
+        ex = u32.GetWindowLongW(h, -20)
+        if h not in OWN and u32.GetWindowTextLengthW(h) and not ex & 0x08000020:   # skip no-activate / click-through overlays
             c = wt.DWORD(); dwm.DwmGetWindowAttribute(h, 14, ctypes.byref(c), 4)   # cloaked = other desktop
             b = ctypes.create_unicode_buffer(64); u32.GetClassNameW(h, b, 64)
-            r = None if c.value or b.value in SKIP else live(h)
-            if r and r[2]-r[0] >= 150 and r[3]-r[1] >= 80 and not (r[2]-r[0] >= VW and r[3]-r[1] >= VH):
-                out.append((h, *r))
+            r = None if c.value or b.value in SKIP else rect(h)
+            if r:
+                allw.append((h, *r))
+                if (not ex & 0x80 and not u32.IsZoomed(h) and r[2]-r[0] >= 150 and r[3]-r[1] >= 80
+                        and not (r[2]-r[0] >= VW and r[3]-r[1] >= VH)):
+                    mov.append((h, *r))
         return True
     u32.EnumWindows(cb, 0)
-    return out
+    return mov, allw
 
 
 # ---- updater ----------------------------------------------------------------------------
@@ -162,11 +172,17 @@ def jump_frames(dh):
     d = b*b - 4*a*dh
     return None if d < 0 else (-b + math.sqrt(d)) / (2*a)
 
+def covered(h, x, y, W):
+    """Is point (x,y) of window h hidden behind a window above it? Uses every visible window (Z), maximised included."""
+    for w in (Z or W):
+        if w[0] == h: return False
+        if w[1] < x < w[3] and w[2] <= y < w[4]: return True
+    return False
+
 def tops(W, x):
-    """(y, hwnd) of window top edges at column x not hidden by a window above, plus the floor."""
-    for i, (h, l, t, r, b) in enumerate(W):
-        if l+6 < x < r-6 and t <= FLOOR and not any(l2 < x < r2 and t2 <= t+2 < b2 for _, l2, t2, r2, b2 in W[:i]):
-            yield t, h
+    """(y, hwnd) of window top edges at column x that you can actually see, plus the floor."""
+    for h, l, t, r, b in W:
+        if l+6 < x < r-6 and t <= FLOOR and not covered(h, x, t+2, W): yield t, h
     yield FLOOR, None
 
 class Fig:
@@ -222,7 +238,7 @@ class Fig:
     def ground(s, W):
         if s.sup:
             R = live(s.sup)
-            if not R: return s.drop()
+            if not R or covered(s.sup, s.x, R[1]+2, W): return s.drop()   # window gone, or someone put a window over it
             s.x += R[0]-s.supl; s.supl = R[0]; s.y = R[1]      # ride the window
             lo, hi = R[0]+10, R[2]-10
         else: s.y, lo, hi = FLOOR, VX+10, VX+VW-10
@@ -250,7 +266,8 @@ class Fig:
     def shove(s, W):
         for h, l, t, r, b in W:
             gap = l - s.x if s.dir > 0 else s.x - r
-            if 0 < gap < 10 and t < s.y-15 and b > s.y-45 and r-l < VW*.9 and not down():
+            if (0 < gap < 10 and t < s.y-15 and b > s.y-45 and r-l < VW*.9 and not down()
+                    and not covered(h, l if s.dir > 0 else r, s.y-30, W)):   # only shove windows we can see
                 s.act, s.pw, s.acc, s.timer = 'push', h, 0, random.randint(60, 150); return
 
     def push(s):
@@ -304,8 +321,9 @@ class Fig:
             s.cross = None
         exposed = lambda w: any(h == w[0] for _, h in tops(W, min(max(s.x, w[1]+30), w[3]-30)))
         ledges = [w for w in W if 20 < y-w[2] <= JUMP_MAX and w[0] != s.sup and exposed(w)]
-        walls = [w for w in W if y-w[2] > JUMP_MAX and w[2] > VY+90 and w[4] > y-20]
-        blockers = [w for w in W if w[2] < y-15 and w[4] > y-45 and w[3]-w[1] < VW*.9]
+        walls = [w for w in W if y-w[2] > JUMP_MAX and w[2] > VY+90 and w[4] > y-20 and exposed(w)]
+        blockers = [w for w in W if w[2] < y-15 and w[4] > y-45 and w[3]-w[1] < VW*.9
+                    and not covered(w[0], w[1] if s.x < (w[1]+w[3])/2 else w[3], y-30, W)]
         opts = ['walk']*3 + ['dance', 'wave', 'cursor']
         if not s.sup: opts += ['edge'] + ['push']*2*bool(blockers)
         if EXPL.ready(): opts += ['explore']*2
@@ -361,6 +379,22 @@ class Fig:
 
 
 # ---- app --------------------------------------------------------------------------------
+def start_tray(stop):
+    """System-tray icon with a Quit item. Optional: skipped (Ctrl+Shift+Q still works) if pystray/Pillow are missing."""
+    try:
+        import pystray
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return None
+    img = Image.new("RGBA", (64, 64)); d = ImageDraw.Draw(img); c = "#e03030"
+    for seg in ((32, 24, 32, 44), (32, 30, 17, 40), (32, 30, 47, 40), (32, 44, 20, 60), (32, 44, 44, 60)):
+        d.line(seg, fill=c, width=5)
+    d.ellipse((22, 3, 42, 23), outline=c, width=4, fill="white")
+    icon = pystray.Icon("sticks", img, f"Stick Figures {VERSION}",
+                        pystray.Menu(pystray.MenuItem("Quit", lambda icon, item: stop.append(1))))
+    icon.run_detached()
+    return icon
+
 def main():
     import tkinter as tk
     n = int(next((a for a in sys.argv[1:] if a.isdigit()), 3))
@@ -389,12 +423,19 @@ def main():
             return False
         os.startfile(sys.executable); return True
 
+    stop = []                                              # the tray's Quit item appends here (it runs on another thread)
+    tray = start_tray(stop)
+
+    def quit():
+        if tray: tray.stop()                               # else the icon lingers in the tray until hovered
+        root.destroy()
+
     def tick():
         frame[0] += 1
-        if found and (t := found.pop()) and offer(t): return root.destroy()
-        if frame[0] % 6 == 1: W[:] = list_windows(); EXPL.poll()
+        if found and (t := found.pop()) and offer(t): return quit()
+        if frame[0] % 6 == 1: m, a = list_windows(); W[:], Z[:] = m, a; EXPL.poll()
         if frame[0] % 90 == 0: root.attributes('-topmost', True)
-        if all(u32.GetAsyncKeyState(k) & 0x8000 for k in (0x11, 0x10, 0x51)): return root.destroy()
+        if stop or all(u32.GetAsyncKeyState(k) & 0x8000 for k in (0x11, 0x10, 0x51)): return quit()
         cv.delete('all')
         for f in figs: f.step(W); f.draw(cv)
         root.after(33, tick)
@@ -460,6 +501,10 @@ def selftest():
     for w in wins.values(): assert VX <= w[0] and w[2] <= VX+VW
     assert {'air', 'climb', 'push', 'stomp'} <= seen, seen
     assert hops[0], "no figure ever hopped into the gap and pushed back"
+    Z[:] = [(99, 0, 0, 1920, 1040)] + [(h, *w) for h, w in wins.items()]   # a maximised window over everything
+    assert list(tops([(h, *w) for h, w in wins.items()], 1000)) == [(FLOOR, None)], "walked on a hidden window"
+    assert covered(2, 1000, 502, [(h, *w) for h, w in wins.items()])
+    Z[:] = []
     assert EXPL.n, "no figure ever opened a folder"
     print("ok; behaviours seen:", sorted(seen), "gap hops:", hops[0], "windows left:", len(wins))
 
