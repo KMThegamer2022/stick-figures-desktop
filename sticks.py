@@ -8,12 +8,14 @@ They walk, dance, wave, chase your mouse, jump onto windows, climb window sides 
 the screen edges, shove windows sideways, and stomp a window's minimise button.
 Maximised / minimised windows are never touched. The overlay is click-through.
 """
-import ctypes, math, random, sys
+import ctypes, math, os, random, sys, time
 from ctypes import wintypes as wt
 
 GRAV, JUMP_V, JUMP_MAX = 0.9, 16.5, 135   # JUMP_MAX: tallest ledge (px) a jump can reach
 SPEED, PUSH, CLIMB = 2.2, 1.6, 2.0
+GAP = 70                                   # pushed windows stop this far from the screen edge, leaving room to hop down behind them
 PRESS_MINIMIZE = True                      # True: a stomp really minimises that window
+EXPLORE = True                             # True: figures open your Desktop folders (and subfolders) in File Explorer
 COLORS = ["#202020", "#e03030", "#2fa84f", "#2f6fe0", "#f0b020", "#f07820"]
 SKIP = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}
 KEY = "#010101"                            # transparent colour of the overlay
@@ -30,7 +32,8 @@ if WIN:
     for name, args in dict(IsWindow=[H], IsWindowVisible=[H], IsIconic=[H], IsZoomed=[H],
                            GetWindowTextLengthW=[H], GetWindowLongW=[H, I], SetWindowLongW=[H, I, ctypes.c_long],
                            GetClassNameW=[H, wt.LPWSTR, I], GetWindowRect=[H, ctypes.c_void_p], ShowWindow=[H, I],
-                           SetWindowPos=[H, H, I, I, I, I, wt.UINT], GetAncestor=[H, wt.UINT]).items():
+                           SetWindowPos=[H, H, I, I, I, I, wt.UINT], GetAncestor=[H, wt.UINT],
+                           PostMessageW=[H, wt.UINT, wt.WPARAM, wt.LPARAM]).items():
         getattr(u32, name).argtypes = args
     u32.GetAncestor.restype = H
     dwm.DwmGetWindowAttribute.argtypes = [H, wt.DWORD, ctypes.c_void_p, wt.DWORD]
@@ -73,6 +76,48 @@ def list_windows():
     return out
 
 
+def explorer_hwnds():
+    out = set()
+    @ENUM
+    def cb(h, _):
+        b = ctypes.create_unicode_buffer(64); u32.GetClassNameW(h, b, 64)
+        if b.value == "CabinetWClass" and u32.IsWindowVisible(h): out.add(h)
+        return True
+    u32.EnumWindows(cb, 0)
+    return out
+
+def desktop():
+    b = ctypes.create_unicode_buffer(260); ctypes.windll.shell32.SHGetFolderPathW(0, 0x10, 0, 0, b); return b.value
+
+def folders(p):
+    """Real (non-link, non-hidden) subfolders of p. Only folders: never files, shortcuts or programs."""
+    try:
+        return [e.path for e in os.scandir(p) if e.is_dir(follow_symlinks=False)
+                and not e.name.startswith(('.', '$')) and not getattr(e.stat(), 'st_file_attributes', 0) & 6]
+    except OSError:
+        return []
+
+class Explorer:
+    """Opens a Desktop folder in File Explorer, then often a subfolder of it, and so on. At most 2 stay open."""
+    def __init__(s): s.path = s.pending = None; s.opened = []; s.last = 0
+    def ready(s): return EXPLORE and time.time() - s.last > 20
+    def open_next(s):
+        s.last = time.time()
+        subs = folders(s.path) if s.path else []
+        s.path = random.choice(subs) if subs and random.random() < .7 else random.choice(folders(desktop()) or [None])
+        if s.path: s.pending = explorer_hwnds(); os.startfile(s.path)
+    def poll(s):
+        if s.pending is None and not s.opened: return
+        s.opened = [h for h in s.opened if u32.IsWindow(h)]
+        if s.pending is not None:                     # find the window Explorer just made so we can close it later
+            new = explorer_hwnds() - s.pending
+            if new: s.opened += sorted(new); s.pending = None
+            elif time.time() - s.last > 5: s.pending = None
+        while len(s.opened) > 2: u32.PostMessageW(s.opened.pop(0), 0x10, 0, 0)   # WM_CLOSE the oldest of ours
+
+EXPL = Explorer()
+
+
 # ---- physics / behaviour ---------------------------------------------------------------
 def jump_frames(dh):
     """Frames for a jump to come DOWN onto a ledge dh px higher, or None if too high."""
@@ -91,7 +136,7 @@ class Fig:
     def __init__(s, color):
         s.c, s.x, s.y, s.vx, s.vy, s.t, s.acc = color, random.uniform(VX+80, VX+VW-80), VY+40, 0, 0, 0, 0
         s.dir, s.mode, s.act, s.sup, s.supl, s.goal, s.timer = random.choice((-1, 1)), 'air', 'walk', None, 0, None, 0
-        s.tgt = s.pw = s.cw = s.top = None; s.wall = 1
+        s.tgt = s.pw = s.cw = s.top = s.cross = None; s.wall, s.pushback = 1, 0   # cross=(window, gap side); pushback=dir to shove next
 
     def step(s, W):
         s.t += 1
@@ -104,7 +149,13 @@ class Fig:
         s.y, s.vx, s.vy, s.mode, s.sup, s.act, s.timer = y, 0, 0, 'ground', h, 'walk', 20
         r = h and live(h); s.supl = r[0] if r else 0
         if g and g[0] == 'jump': s.goal = ('press', h, None) if g[1] == h and g[2] == 'press' else None
+        if s.cross:                                    # got on top of the window we pushed: cross to the gap side
+            if h == s.cross[0]: s.goal = ('walkoff', h, s.cross[1])
+            else: s.cross = None
         if s.goal: s.timer = 400
+        if s.pushback:                                 # dropped into the gap: now shove it back the other way
+            if h is None: s.dir, s.timer = s.pushback, 300
+            s.pushback = 0
 
     def fly(s, W):
         py = s.y; s.vy += GRAV; s.y += s.vy
@@ -143,6 +194,10 @@ class Fig:
             s.x += s.dir*SPEED
             if not lo <= s.x <= hi:
                 s.x = min(max(s.x, lo), hi)
+                if s.goal and s.goal[0] == 'walkoff':   # hop down into the gap
+                    s.pushback, s.cross, s.goal = -s.dir, None, None
+                    s.x += s.dir*20                     # step fully past the edge so we don't re-land on the top
+                    return s.drop(s.dir*1.5)
                 if s.sup and random.random() < .4: return s.drop(s.dir*2.5, -4)
                 if not s.sup and random.random() < .6:
                     s.mode, s.wall, s.cw, s.timer, s.top = 'climb', s.dir, None, 0, VY+90 + random.random()*(FLOOR-VY-240)
@@ -151,6 +206,7 @@ class Fig:
             elif not s.sup and not s.goal: s.shove(W)
         elif s.act == 'push': s.push()
         elif s.act == 'stomp' and s.timer == 22 and s.tgt: minimize(s.tgt)
+        elif s.act == 'knock' and s.timer == 22: EXPL.open_next()
         s.timer -= 1
         if s.timer <= 0: s.think(W)
 
@@ -162,7 +218,11 @@ class Fig:
 
     def push(s):
         R = live(s.pw)
-        if not R or down() or (R[2]+PUSH > VX+VW if s.dir > 0 else R[0]-PUSH < VX): s.timer = 0; return
+        lim = R and (R[2]+PUSH > VX+VW-GAP if s.dir > 0 else R[0]-PUSH < VX+GAP)   # pushed as far as it goes
+        if not R or down() or lim:
+            gap = R and (VX+VW-R[2] if s.dir > 0 else R[0]-VX)
+            if lim and gap >= 40 and random.random() < .6: s.cross = (s.pw, s.dir)   # maybe go round the back
+            s.timer = 0; return
         s.acc += s.dir*PUSH; d = int(s.acc); s.acc -= d
         if d: move(s.pw, d)
         R = live(s.pw) or R
@@ -187,6 +247,9 @@ class Fig:
             if abs(tx - s.x) < SPEED+.5:
                 s.mode, s.wall, s.cw, s.goal, s.timer = 'climb', w, h, None, 0
                 s.top = VY+90 + random.random()*(FLOOR-VY-240); return True
+        elif k == 'walkoff':
+            if s.sup != h: s.goal = None; return False
+            s.dir = w; return False
         elif k == 'press':
             if s.sup != h: s.goal = None; return False
             tx = min(max(R[2]-115, R[0]+20), R[2]-20)          # about where the minimise button is
@@ -196,17 +259,25 @@ class Fig:
 
     def think(s, W):
         y = s.y; s.goal = None; s.act = 'walk'; s.timer = random.randint(60, 200); s.dir = random.choice((-1, 1))
+        if s.cross:                                    # just pushed a window to its limit: get on top of it
+            w = next((w for w in W if w[0] == s.cross[0]), None)
+            if w and 20 < y-w[2] <= JUMP_MAX: s.goal, s.timer = ('jump', w[0], None), 400; return
+            if w and y-w[2] > JUMP_MAX and w[4] > y-20:
+                s.goal, s.timer = ('climb', w[0], 1 if s.x < (w[1]+w[3])/2 else -1), 400; return
+            s.cross = None
         exposed = lambda w: any(h == w[0] for _, h in tops(W, min(max(s.x, w[1]+30), w[3]-30)))
         ledges = [w for w in W if 20 < y-w[2] <= JUMP_MAX and w[0] != s.sup and exposed(w)]
         walls = [w for w in W if y-w[2] > JUMP_MAX and w[2] > VY+90 and w[4] > y-20]
         blockers = [w for w in W if w[2] < y-15 and w[4] > y-45 and w[3]-w[1] < VW*.9]
         opts = ['walk']*3 + ['dance', 'wave', 'cursor']
         if not s.sup: opts += ['edge'] + ['push']*2*bool(blockers)
+        if EXPL.ready(): opts += ['explore']*2
         if ledges: opts += ['jump']*3
         if walls: opts += ['climb']*2
         k = random.choice(opts)
         if k == 'dance': s.act, s.timer = 'dance', random.randint(60, 120)
         elif k == 'wave': s.act, s.timer = 'wave', 70
+        elif k == 'explore': s.act, s.timer = 'knock', 45      # stomp pose; opens the folder mid-stomp
         elif k == 'cursor': s.goal, s.timer = ('cursor', None, None), 400
         elif k == 'edge': s.goal, s.timer = ('climb', None, -1 if s.x < VX+VW/2 else 1), 400
         elif k == 'jump':
@@ -240,7 +311,7 @@ class Fig:
         elif a == 'climb':
             c = 0 if s.timer else math.sin(s.t*.3); lean = 6
             A, G = [(160+15*c, 175), (160-15*c, 175)], [(50+25*c, 5), (50-25*c, 5)]
-        elif a == 'stomp':
+        elif a in ('stomp', 'knock'):
             hop = 14*abs(math.sin(s.timer*.25)); A, G = [(130, 140), (125, 135)], [(10, 0), (-10, 0)]
         hx, hy = x, y - 30 - hop
         nx, ny = x + d*lean, hy - 28
@@ -269,7 +340,7 @@ def main():
 
     def tick():
         frame[0] += 1
-        if frame[0] % 6 == 1: W[:] = list_windows()
+        if frame[0] % 6 == 1: W[:] = list_windows(); EXPL.poll()
         if frame[0] % 90 == 0: root.attributes('-topmost', True)
         if all(u32.GetAsyncKeyState(k) & 0x8000 for k in (0x11, 0x10, 0x51)): return root.destroy()
         cv.delete('all')
@@ -279,7 +350,12 @@ def main():
 
 
 def selftest():
-    global live, move, minimize, cursor, down, VX, VY, VW, VH, FLOOR
+    global live, move, minimize, cursor, down, VX, VY, VW, VH, FLOOR, EXPL
+    class FakeExplorer:                           # no real folders opened in the test
+        n = 0
+        ready = lambda s: True
+        def open_next(s): s.n += 1
+    EXPL = FakeExplorer()
     VX, VY, VW, VH, FLOOR = 0, 0, 1920, 1080, 1040   # the fake windows below assume this screen
     for dh in (20, 80, 130):                      # closed-form jump time must match frame-by-frame physics
         y, vy, n = 0, -JUMP_V, 0
@@ -295,7 +371,10 @@ def selftest():
     minimize = lambda h: wins.pop(h, None)
     cursor, down = (lambda: (900, 500)), (lambda: 0)
     random.seed(1)
-    figs, seen = [Fig(COLORS[i]) for i in range(4)], set()
+    figs, seen, hops = [Fig(COLORS[i]) for i in range(4)], set(), [0]
+    _land = Fig.land
+    def land(s, y, h): hops[0] += bool(s.pushback and h is None); _land(s, y, h)   # count hop-into-gap landings
+    Fig.land = land
     class CV:                                     # draw() must run too
         def create_line(self, *a, **k): assert len(a) == 6 or len(a) == 4
         def create_oval(self, *a, **k): pass
@@ -306,7 +385,9 @@ def selftest():
             assert VX <= f.x <= VX+VW and VY <= f.y <= FLOOR+1, (f.x, f.y, f.mode, f.act)
     for w in wins.values(): assert VX <= w[0] and w[2] <= VX+VW
     assert {'air', 'climb', 'push', 'stomp'} <= seen, seen
-    print("ok; behaviours seen:", sorted(seen), "windows left:", len(wins))
+    assert hops[0], "no figure ever hopped into the gap and pushed back"
+    assert EXPL.n, "no figure ever opened a folder"
+    print("ok; behaviours seen:", sorted(seen), "gap hops:", hops[0], "windows left:", len(wins))
 
 
 if __name__ == "__main__":
