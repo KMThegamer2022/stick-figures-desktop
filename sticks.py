@@ -496,8 +496,9 @@ class Fig:
 
 
 # ---- app --------------------------------------------------------------------------------
-def start_tray(stop):
-    """System-tray icon with a Quit item. Optional: skipped (Ctrl+Shift+Q still works) if pystray/Pillow are missing."""
+def start_tray(stop, check):
+    """System-tray icon with 'Check for updates' and 'Quit'. Optional: skipped (Ctrl+Shift+Q still works) if pystray/Pillow
+    are missing. The menu callbacks run on pystray's thread, so they only append to a list the main loop watches."""
     try:
         import pystray
         from PIL import Image, ImageDraw
@@ -508,7 +509,8 @@ def start_tray(stop):
         d.line(seg, fill=c, width=5)
     d.ellipse((22, 3, 42, 23), outline=c, width=4, fill="white")
     icon = pystray.Icon("sticks", img, f"Stick Figures {VERSION}",
-                        pystray.Menu(pystray.MenuItem("Quit", lambda icon, item: stop.append(1))))
+                        pystray.Menu(pystray.MenuItem("Check for updates", lambda icon, item: check.append(1)),
+                                     pystray.MenuItem("Quit", lambda icon, item: stop.append(1))))
     icon.run_detached()
     return icon
 
@@ -525,13 +527,24 @@ def main():
     u32.SetWindowLongW(hw, -20, u32.GetWindowLongW(hw, -20) | 0x80000 | 0x20 | 0x80 | 0x08000000)
     OWN.update({hw, root.winfo_id()})
     figs, W, frame, found = [Fig(COLORS[i % len(COLORS)]) for i in range(n)], [], [0], []
-    if AUTO_UPDATE and getattr(sys, "frozen", False):      # only the built .exe self-updates, never a source checkout
-        try: os.remove(sys.executable + ".old")
-        except OSError: pass
+    from tkinter import messagebox
+    frozen, checking, manual = getattr(sys, "frozen", False), [], [False]   # frozen = the built .exe, not a source checkout
+
+    def start_check(by_user):
+        """Look for a newer release on a background thread (one at a time); the result lands in `found` (tag or None)."""
+        if checking: return
+        checking.append(1); manual[0] = by_user
         threading.Thread(target=lambda: found.append(newer_tag()), daemon=True).start()
 
+    if AUTO_UPDATE and frozen:
+        try: os.remove(sys.executable + ".old")
+        except OSError: pass
+        start_check(False)
+
     def offer(tag):
-        from tkinter import messagebox
+        if not frozen:                                     # swapping sys.executable from source would replace python.exe!
+            messagebox.showinfo("Stick Figures", f"Version {tag} is available (you have {VERSION}).\nGet it from https://github.com/{REPO}/releases")
+            return False
         if not messagebox.askyesno("Stick Figures", f"Version {tag} is available (you have {VERSION}).\nDownload it and restart now?"):
             return False
         try: swap_exe(tag, sys.executable)
@@ -540,8 +553,8 @@ def main():
             return False
         os.startfile(sys.executable); return True
 
-    stop = []                                              # the tray's Quit item appends here (it runs on another thread)
-    tray = start_tray(stop)
+    stop, check = [], []                                   # the tray's Quit / Check-for-updates items append here
+    tray = start_tray(stop, check)
 
     def quit():
         if tray: tray.stop()                               # else the icon lingers in the tray until hovered
@@ -549,7 +562,12 @@ def main():
 
     def tick():
         frame[0] += 1
-        if found and (t := found.pop()) and offer(t): return quit()
+        if check: check.clear(); start_check(True)         # "Check for updates" clicked in the tray
+        if found:
+            t = found.pop(); checking.clear()
+            if t and offer(t): return quit()
+            if not t and manual[0]:
+                messagebox.showinfo("Stick Figures", f"No newer version found (you have {VERSION}), or GitHub couldn't be reached.")
         if frame[0] % 6 == 1: m, a = list_windows(); W[:], Z[:] = m, a; EXPL.poll()
         if frame[0] % 90 == 0: root.attributes('-topmost', True)
         if stop or all(u32.GetAsyncKeyState(k) & 0x8000 for k in (0x11, 0x10, 0x51)): return quit()
